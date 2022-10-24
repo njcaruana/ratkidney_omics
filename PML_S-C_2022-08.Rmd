@@ -1,0 +1,1050 @@
+---
+title: "PMV_SHGonly"
+author: "nikeisha"
+date: "27/05/2020"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(pacman)
+pacman::p_load("tidyverse","plyr","stringr","limma", "gplots", "ggplot2","ComplexHeatmap","dendextend", "impute","vsn", "circlize", "RColorBrewer", "pathview", "mixOmics")
+```
+
+***
+~~PROTEOMICS~~
+
+***
+
+Import of Data 
+```{r}
+#bring in proteins matrix and IMPI annotations
+protliver <- read_tsv("data/ratliverprots_1010.txt", na = "0", guess_max = 100000)
+IMPIannos <- read_tsv("data/ratliverprots_IMPI.txt", col_names = TRUE)
+sampledata <- read_tsv("data/sampledata.txt", col_names = TRUE)
+```
+ 
+Clean up of data
+```{r}
+#clean up proteomic results and filter
+rmcrp <- protliver %>% dplyr::filter(!grepl('\\+', `Reverse`)) %>% dplyr::filter(!grepl('\\+', `Only identified by site`)) %>% dplyr::filter(!grepl('\\+', `Potential contaminant`))
+filtered_data <- rmcrp[-which(rowMeans(is.na(rmcrp)) > 0.30),]
+filtered_data$`Gene names` = sapply(filtered_data$`Gene names`, toupper)
+filtered_data <- filtered_data %>% filter(!grepl("CON",`Majority protein IDs`)) %>% filter(!grepl("REV",`Majority protein IDs`))
+
+#annotate with IMPI
+annoed_data <- merge(IMPIannos, filtered_data, by.x="Symbol", by.y="Gene names", all.y = TRUE)
+```
+
+```{r}
+mito_things <- filter(annoed_data, Category == "Known mitochondrial")
+
+liverprots <- mito_things[c(1:2,6:7,11:46,60)]
+rownames(liverprots) <- liverprots$`Protein IDs`
+info_prots <- liverprots[c(1:4,41)]
+raw_prots <- liverprots[c(5:40)]
+```
+
+Sample Data
+```{r}
+#edit sample data
+sampledata <- sampledata[c(2:4)]
+
+target <- c("CTRL", "MHG", "SHG")
+sampledata <- left_join(data.frame(Diabetes=target),sampledata,by="Diabetes")
+datacolnames <- as.vector(unlist(sampledata["Sample"]))
+rownames(sampledata) <- sampledata$Sample
+datacolnames <- as.character(datacolnames)
+raw_prots <- as.data.frame(raw_prots)
+raw_prots <- raw_prots[datacolnames]
+```
+
+Normalise and Impute 
+```{r}
+#normalise and impute 
+expr_data <- log2(raw_prots)
+expr_data <- normalizeCyclicLoess(expr_data)
+imputed <- impute.knn(expr_data, k = 4)
+imputed <- imputed[[1]]
+imputedall <- cbind(imputed, info_prots)
+```
+
+```{r}
+mds_data <- plotMDS(imputed, plot = FALSE, top = 500, dim.plot = c(2,3))
+mds_data <- data.frame(x=mds_data$x,y=mds_data$y,sampledata)
+
+#pdf("MDS_kidneyrat.pdf", height = 7, width = 9)
+p <- ggplot(mds_data,aes(x=x,y=y, label = Sample)) + geom_point(aes(color = Diabetes), size=7) +  scale_color_discrete()
+#dev.off()
+
+# ggsave(
+#   "diabetesprot_mds.pdf",
+#   p,
+#   width = 10,
+#   height = 9,
+#   dpi = 300,
+#   useDingbats=FALSE
+# )
+
+long_imputedall <- imputedall %>% gather("sample","intensity", -Symbol, -`Gene ID`, -Description,-Category,-`Protein IDs`)
+
+```
+
+
+#CALCULATING ZSCORE - NEED TO KEEP OG DATA
+```{r}
+subject_zscore <- long_imputedall %>% group_by(sample) %>% mutate(z_score = scale(intensity))
+subject_zscore <- subject_zscore[,-7]
+wide_subject_zscore <- subject_zscore %>% spread(sample,z_score)
+
+zscoretable <- as.data.frame(wide_subject_zscore[c(6:41)])
+zscoreinfo <- wide_subject_zscore[c(1:5)]
+
+zscoretable <- zscoretable[datacolnames]
+rownames(zscoretable) <- zscoreinfo$`Protein IDs`
+
+#scale by row
+scaledimpute <- t(scale(t(zscoretable)))
+
+scaledimpute <- as.data.frame(scaledimpute)
+scaledimpute <- scaledimpute[datacolnames]
+scaledimpute <- cbind(zscoreinfo, scaledimpute)
+```
+
+Visualisation overall
+```{r}
+#visualisation
+diabetestype <- sampledata$Diabetes
+colAnn <- HeatmapAnnotation(df=diabetestype, which="col", annotation_width=unit(c(1, 4), "cm"), gap=unit(1, "mm"))
+row_anno = HeatmapAnnotation(df = zscoreinfo$Category, which = "row", show_legend = TRUE)
+
+Heatmap(as.matrix(scaledimpute), row_dend_width = unit(5, "cm"), left_annotation = row_anno,bottom_annotation = colAnn, row_names_gp = gpar(fontsize = 10))
+```
+
+
+Differential Expression
+```{r}
+#differential expression
+design_all <- model.matrix(~0 + Diabetes + Batch, sampledata)
+colnames(design_all) <- gsub("Diabetes","", colnames(design_all))
+rownames(design_all) <- sampledata$Sample
+
+contr.matrix_kidney <- makeContrasts(
+    CTRLvsMHG = MHG-CTRL,
+    CTRLvsSHG = SHG-CTRL,
+    MHGvsSHG = SHG-MHG,
+    levels = design_all
+  )
+
+all_fit <- lmFit(imputed, design_all)
+cfit_all <- contrasts.fit(all_fit, contrasts = contr.matrix_kidney)
+all_efit<-eBayes(cfit_all)
+
+all_comp_prots <- topTable(all_efit, n=Inf, coef=2, genelist = zscoreinfo[c(1,5)], adjust.method = "BH")
+all_comp_prots2 <- subset(all_comp_prots, all_comp_prots$adj.P.Val<0.05)
+```
+
+#write out each set of data
+```{r}
+allprots_threewaycomp <- topTable(all_efit, n=Inf, genelist = zscoreinfo[c(1,5)], adjust.method = "BH")
+threeway_DE <- subset(allprots_threewaycomp, allprots_threewaycomp$adj.P.Val<0.05)
+#write.xlsx(allprots_threewaycomp, "allprots_threewaycomp_2021-08.xlsx")
+
+allprots_MHGvsNG <- topTable(all_efit, n=Inf, coef=1, genelist = zscoreinfo[c(1,5)], adjust.method = "BH")
+MHGvsNG_DE <- subset(allprots_MHGvsNG, allprots_MHGvsNG$adj.P.Val<0.05)
+#write.xlsx(allprots_MHGvsNG, "allprots_MHGvsNG_2021-08.xlsx")
+
+allprots_SHGvsNG <- topTable(all_efit, n=Inf, coef=2, genelist = zscoreinfo[c(1,5)], adjust.method = "BH")
+SHGvsNG_DE <- subset(allprots_SHGvsNG, allprots_SHGvsNG$adj.P.Val<0.05)
+#write.xlsx(allprots_SHGvsNG, "allprots_SHGvsNG_2021-08.xlsx")
+
+allprots_SHGvsMHG <- topTable(all_efit, n=Inf, coef=3, genelist = zscoreinfo[c(1,5)], adjust.method = "BH")
+SGvsMHG_DE <- subset(allprots_SHGvsMHG, allprots_SHGvsMHG$adj.P.Val<0.05)
+#write.xlsx(allprots_SHGvsMHG, "allprots_SHGvsMHG_2021-08.xlsx")
+```
+
+
+```{r}
+library(EnhancedVolcano)
+
+keyvals <- ifelse(
+    all_comp_prots$logFC < -0.15 & all_comp_prots$adj.P.Val < 0.05, 'royalblue',
+      ifelse(all_comp_prots$logFC > 0.15 & all_comp_prots$adj.P.Val < 0.05, 'red',
+        'black'))
+  keyvals[is.na(keyvals)] <- 'black'
+  names(keyvals)[keyvals == 'red'] <- 'Up'
+  names(keyvals)[keyvals == 'black'] <- 'mid'
+  names(keyvals)[keyvals == 'royalblue'] <- 'Down'
+  
+
+#pdf("vol-MHGNG_20210719.pdf", height = 12, width = 10, useDingbats=FALSE)
+EnhancedVolcano(all_comp_prots,
+                lab = all_comp_prots$Symbol,
+                x = 'logFC',
+                y = 'adj.P.Val',
+                cutoffLineType="blank",
+                colCustom = keyvals,
+                pointSize = 10,
+                shape = c(16),
+                ylim = c(0, 5),
+                xlim = c(-2, 2),
+                labSize = 6.0)
+#dev.off()
+```
+
+```{r}
+subset <- rownames(all_comp_prots2)
+subset <- as.data.frame(subset)
+subset2 <- scaledimpute %>% filter(`Protein IDs` %in% subset$subset) 
+
+#remove blank cells 
+subset2 <- subset2[!(is.na(subset2$Symbol) | subset2$Symbol==""), ]
+rownames(subset2) <- subset2$Symbol
+
+#just SHG all expression
+subsetSHG <- subset2[-c(18:29)]
+diabetestype_SHG <- diabetestype[c(1:12,25:36)]
+
+#colours HM
+col = colorRamp2(c(-2, 0, 2), c("#0A3C72", "white", "#7B0722"))
+#colours and annotation
+colAnn_SHG <- HeatmapAnnotation(Diabetes=diabetestype_SHG, which="col", annotation_width=unit(c(1, 4), "cm"), gap=unit(1, "mm"),col = list(Diabetes = c("CTRL" = "darkgreen", "SHG" = "aquamarine")))
+row_anno = HeatmapAnnotation(df = zscoreinfo$Category, which = "row", show_legend = TRUE)
+
+dendcol_all <- t(subsetSHG[c(6:29)]) %>% dist(method = "euclidean") %>% hclust(method = "ward.D2") %>% as.dendrogram %>% color_branches( k = 2)
+dendrow_all <- (subsetSHG[c(6:29)]) %>% dist(method = "euclidean") %>% hclust(method = "ward.D2") %>% as.dendrogram %>% color_branches( k = 2)
+
+#pdf("HMDE_SHGCTRL_2021-07-19.pdf", height = 20, width = 8)
+Heatmap(as.matrix(subsetSHG[c(6:29)]),bottom_annotation = colAnn_SHG, cluster_rows = dendrow_all, cluster_columns = dendcol_all, col = col, split = 2, show_column_names = FALSE, show_column_dend = TRUE, show_row_dend = FALSE, left_annotation = rowAnnotation(foo = anno_block(gp = gpar(fill = 1:2))))
+#dev.off()
+```
+
+
+***
+~~LIPIDOMICS CLASSES~~
+
+***
+
+Import and clean
+```{r}
+lipidkidney <- read_tsv("data/IM_LipidClass.txt", na = "0", guess_max = 100000)
+lipidkidney <- as.data.frame(lipidkidney)
+rownames(lipidkidney) <- lipidkidney$`sample ID`
+kidneySD <- lipidkidney[c(1:3)]
+lipidkidney <- lipidkidney[-c(1:3)]
+lipidkidney <- lipidkidney[-c(4,7,24)]
+#lipidkidney <- log2(lipidkidney)
+lipidkidney <-lipidkidney[sapply(lipidkidney, function(lipidkidney) !any(is.na(lipidkidney)))]
+```
+
+Normalisation
+```{r}
+#ttests
+#sampledata lipids
+K_SD <- kidneySD[c(2:3)]
+colnames(K_SD) <- c("sample","diabetes")
+K_SD <- K_SD %>% 
+  mutate(diabetes = str_replace(diabetes, "black", "CTRL")) %>% 
+  mutate(diabetes = str_replace(diabetes, "blue", "MHG")) %>% 
+  mutate(diabetes = str_replace(diabetes, "red", "SHG"))
+
+#normalise the data - take the mean of the log 
+lipidkidney_log <- log2(lipidkidney)
+lipidkidney_norm <- normalizeQuantiles(lipidkidney_log)
+#lipidkidney_norm <- lipidkidney_log
+```
+
+MDS plot
+```{r}
+#check mds
+T_norm <- t(lipidkidney_norm)
+mds_data_kid <- plotMDS(T_norm, plot = TRUE)
+mds_data_kid <- data.frame(x=mds_data_kid$x,y=mds_data_kid$y,K_SD[names(mds_data_kid$x),])
+
+#pdf("MDS_kidneyrat_lipidsclass.pdf", height = 7, width = 9)
+ggplot(mds_data_kid,aes(x=x,y=y)) + geom_point(aes(color = diabetes), size=3)
+#dev.off()
+```
+
+Differential Expression analysis 
+```{r}
+#DE
+design_all <- model.matrix(~0 + diabetes, K_SD)
+colnames(design_all) <- gsub("diabetes","", colnames(design_all))
+rownames(design_all) <- K_SD$sample
+
+contr.matrix_kidneylipid <- makeContrasts(
+    CTRLvsMHG = MHG-CTRL,
+    CTRLvsSHG = SHG-CTRL,
+    MHGvsSHG = SHG-MHG,
+    levels = design_all
+  )
+
+all_fit <- lmFit(T_norm, design_all)
+cfit_all <- contrasts.fit(all_fit, contrasts = contr.matrix_kidneylipid)
+all_efit<-eBayes(cfit_all)
+
+all_comp_lips <- topTable(all_efit, coef=2, n=Inf, adjust.method = "BH")
+all_comp_lips2 <- subset(all_comp_lips, all_comp_lips$adj.P.Val<0.05)
+
+#expression for HM overall
+subset_lipids <- rownames(all_comp_lips2)
+subset_lipids <- as.data.frame(subset_lipids)
+T_norm <- as.data.frame(T_norm)
+T_norm$Symbol <- rownames(T_norm)
+subset_lipids2 <- T_norm %>% filter(Symbol %in% subset_lipids$subset_lipids) 
+rownames(subset_lipids2) <- subset_lipids2$Symbol
+diabetestype <- K_SD$diabetes
+
+#shgonly
+diabetestype <- diabetestype[-c(13:24)]
+col = colorRamp2(c(11, 12, 13),c("#3e5d89ff","white","#7B0722"))
+colAnn_lip <- HeatmapAnnotation(diabetestype=diabetestype, which="col", annotation_width=unit(c(1, 4), "cm"), gap=unit(1, "mm"))
+
+dendcol_lipid <- t(subset_lipids2[c(1:12,25:36)]) %>% dist(method = "euclidean") %>% hclust(method = "ward.D2") %>% as.dendrogram %>% color_branches( k = 2)
+
+dendrow_lipid <- subset_lipids2[c(1:12,25:36)] %>% dist(method = "euclidean") %>% hclust(method = "ward.D2") %>% as.dendrogram %>% color_branches( k = 3)
+
+#pdf("results/figures/HM_knownmito_lipidsclass_SHG_202108.pdf", height = 15, width = 17)
+Heatmap(as.matrix(subset_lipids2[c(1:12,25:36)]), cluster_columns = dendcol_lipid, cluster_rows = dendrow_lipid, bottom_annotation = colAnn_lip)
+#dev.off()
+```
+
+#write out each set of data
+```{r}
+lipidC_threewaycomp <- topTable(all_efit, n=Inf, adjust.method = "BH")
+threeway_DE <- subset(lipidC_threewaycomp, lipidC_threewaycomp$adj.P.Val<0.05)
+#write.xlsx(lipidC_threewaycomp, "lipidC_threewaycomp_2021-08.xlsx", rowNames = TRUE)
+
+lipidC_MHGvsNG <- topTable(all_efit, n=Inf, coef=1, adjust.method = "BH")
+MHGvsNG_DE <- subset(lipidC_MHGvsNG, lipidC_MHGvsNG$adj.P.Val<0.05)
+#write.xlsx(lipidC_MHGvsNG, "lipidC_MHGvsNG_2021-08.xlsx", rowNames = TRUE)
+
+lipidC_SHGvsNG <- topTable(all_efit, n=Inf, coef=2,  adjust.method = "BH")
+SHGvsNG_DE <- subset(lipidC_SHGvsNG, lipidC_SHGvsNG$adj.P.Val<0.05)
+#write.xlsx(lipidC_SHGvsNG, "lipidC_SHGvsNG_2021-08.xlsx", rowNames = TRUE)
+
+lipidC_SHGvsMHG <- topTable(all_efit, n=Inf, coef=3, adjust.method = "BH")
+SHGvsMHG_DE <- subset(lipidC_SHGvsMHG, lipidC_SHGvsMHG$adj.P.Val<0.05)
+#write.xlsx(lipidC_SHGvsMHG, "lipidC_SHGvsMHG_2021-08.xlsx", rowNames = TRUE)
+```
+
+***
+~~LIPIDOMICS SPECIES~~
+
+***
+
+```{r}
+lipidkidney_species <- read_tsv("data/IMlipids_species.txt", na = "0", guess_max = 100000)
+lipidkidney_species <- as.data.frame(lipidkidney_species)
+rownames(lipidkidney_species) <- lipidkidney_species$`sample ID`
+lipidkidney_species <- lipidkidney_species[-c(1:3)]
+lipidkidney_species <-lipidkidney_species[sapply(lipidkidney_species, function(lipidkidney_species) !any(is.na(lipidkidney_species)))]
+
+MyResult.pca <- pca(lipidkidney_species)
+plotIndiv(MyResult.pca, group = kidneySD$group, legend = TRUE, col.per.group = c("black", "blue", "red"))
+plotVar(MyResult.pca)      # 3 Plot the variables
+
+plotLoadings(MyResult.pca)
+
+plotIndiv(MyResult.pca2,
+          group = kidneySD$group, style="3d",
+          legend = TRUE)
+
+
+#PLS-DA
+class <- as.factor(kidneySD$group)
+Y <- class
+X  <- lipidkidney_species
+
+MyResult.splsda <- splsda(X, Y, keepX = c(500,500)) # 1 Run the method
+plotIndiv(MyResult.splsda)                          # 2 Plot the samples (coloured by classes automatically)
+
+plotVar(MyResult.splsda)                            # 3 Plot the variables
+
+MyResult.plsda <- plsda(X,Y) # 1 Run the method
+plotIndiv(MyResult.plsda)    # 2 Plot the samples
+
+#pdf("sPLS-DA_lipids.pdf", height = 10, width = 12)
+plotIndiv(MyResult.splsda, ind.names = TRUE, col.per.group = c("black", "blue", "red"), legend=TRUE, ellipse = TRUE, star = FALSE, title = 'sPLS-DA on Rat Kidney Lipids',
+          X.label = 'PLS-DA 1', Y.label = 'PLS-DA 2')
+#dev.off()
+#auc.plsda <- auroc(MyResult.splsda)
+```
+
+```{r}
+#ttests
+#sampledata lipids
+K_SD <- kidneySD[c(2:3)]
+colnames(K_SD) <- c("sample","diabetes")
+K_SD <- K_SD %>% 
+   mutate(diabetes = str_replace(diabetes, "black", "CTRL")) %>% 
+   mutate(diabetes = str_replace(diabetes, "blue", "MHG")) %>% 
+   mutate(diabetes = str_replace(diabetes, "red", "SHG"))
+
+#normalise the data - take the mean of the log 
+lipidkidney_log <- log2(lipidkidney_species)
+lipidkidney_normspec <- normalizeBetweenArrays(lipidkidney_log)
+
+#check mds
+T_norm_species <- t(lipidkidney_normspec)
+mds_data_kid <- plotMDS(T_norm_species, plot = TRUE)
+mds_data_kid <- data.frame(x=mds_data_kid$x,y=mds_data_kid$y,K_SD[names(mds_data_kid$x),])
+#pdf("MDS_kidneyrat_lipidsspecies.pdf", height = 7, width = 9)
+ggplot(mds_data_kid,aes(x=x,y=y)) + geom_point(aes(color = diabetes), size=7) 
+#dev.off()
+
+#DE
+design_all <- model.matrix(~0 + diabetes, K_SD)
+colnames(design_all) <- gsub("diabetes","", colnames(design_all))
+rownames(design_all) <- K_SD$sample
+
+contr.matrix_kidneylipid <- makeContrasts(
+    CTRLvsMHG = MHG-CTRL,
+    CTRLvsSHG = SHG-CTRL,
+    MHGvsSHG = SHG-MHG,
+    levels = design_all
+  )
+
+all_fit <- lmFit(T_norm_species, design_all)
+cfit_all <- contrasts.fit(all_fit, contrasts = contr.matrix_kidneylipid)
+all_efit<-eBayes(cfit_all)
+
+all_comp_sp <- topTable(all_efit,n=Inf, adjust.method = "BH")
+all_comp_sp2 <- subset(all_comp_sp, all_comp_sp$adj.P.Val<0.05)
+all_comp_sp2$names <- rownames(all_comp_sp2)
+
+```
+
+```{r}
+std.error <- all_fit$stdev.unscaled * all_fit$sigma
+std.error_b <- all_efit$stdev.unscaled * all_efit$sigma
+```
+
+#write out each set of data
+```{r}
+alllipid_threewaycomp <- topTable(all_efit, n=Inf, adjust.method = "BH", confint = TRUE)
+threeway_DE <- subset(alllipid_threewaycomp, alllipid_threewaycomp$adj.P.Val<0.05)
+#write.xlsx(alllipid_threewaycomp, "alllipid_threewaycomp_2021-08.xlsx", rowNames = TRUE)
+
+alllipid_MHGvsNG <- topTable(all_efit, n=Inf, coef=1, adjust.method = "BH", confint=TRUE)
+MHGvsNG_DE <- subset(alllipid_MHGvsNG, alllipid_MHGvsNG$adj.P.Val<0.05)
+#write.xlsx(alllipid_MHGvsNG, "alllipid_MHGvsNG_2021-08.xlsx", rowNames = TRUE)
+
+alllipid_SHGvsNG <- topTable(all_efit, n=Inf, coef=2,  adjust.method = "BH", confint=TRUE)
+SHGvsNG_DE <- subset(alllipid_SHGvsNG, alllipid_SHGvsNG$adj.P.Val<0.05)
+#write.xlsx(alllipid_SHGvsNG, "alllipid_SHGvsNG_2021-08.xlsx", rowNames = TRUE)
+
+alllipid_SHGvsMHG <- topTable(all_efit, n=Inf, coef=3, adjust.method = "BH", confint=TRUE)
+SHGvsMHG_DE <- subset(alllipid_SHGvsMHG, alllipid_SHGvsMHG$adj.P.Val<0.05)
+#write.xlsx(alllipid_SHGvsMHG, "alllipid_SHGvsMHG_2021-08.xlsx", rowNames = TRUE)
+```
+
+
+```{r}
+
+#extras for output
+all_comp_spshg <- topTable(all_efit, coef = 2, n=Inf, adjust.method = "BH")
+all_comp_spshg <- subset(all_comp_spshg, all_comp_spshg$adj.P.Val<0.05)
+lipidkidney_normspec2 <- t(lipidkidney_normspec)
+#write.table( lipidkidney_normspec2,"normlog_lipidsp.txt", sep =  '\t', quote = FALSE)
+
+#expression for HM overall
+subset_lipids_sp <- rownames(all_comp_spshg)
+subset_lipids_sp <- as.data.frame(subset_lipids_sp)
+T_norm_species <- as.data.frame(T_norm_species)
+T_norm_species$Symbol <- rownames(T_norm_species)
+subset_lipids_sp2 <- T_norm_species %>% filter(Symbol %in% subset_lipids_sp$subset_lipids_sp)
+rownames(subset_lipids_sp2) <- subset_lipids_sp2$Symbol
+
+#just SHG all expression
+diabetestype_SHG <- diabetestype[c(1:12,25:36)]
+SHG_diabetes <- subset_lipids_sp2[c(1:12,25:36)]
+
+colAnn_SHG <- HeatmapAnnotation(Diabetes=diabetestype_SHG, which="col", annotation_width=unit(c(1, 4), "cm"), gap=unit(1, "mm"),col = list(Diabetes = c("CTRL" = "darkgreen", "SHG" = "aquamarine")))
+
+dendcol_all <- t(SHG_diabetes) %>% dist(method = "euclidean") %>% hclust(method = "ward.D2") %>% as.dendrogram %>% color_branches( k = 2)
+
+dendrow_all <- (SHG_diabetes) %>% dist(method = "euclidean") %>% hclust(method = "ward.D2") %>% as.dendrogram %>% color_branches( k = 2)
+
+#pdf("HM_DEprots_SHGCTRL2.pdf", height = 50, width = 8)
+Heatmap(as.matrix(SHG_diabetes),bottom_annotation = colAnn_SHG, cluster_rows = dendrow_all, cluster_columns = dendcol_all)
+#dev.off()
+```
+
+#subset for CLs 
+```{r}
+subsetCL <- t(lipidkidney_log)
+subsetCL <- T_norm_species[c(1:12,25:36,37)]
+subsetCL <- subsetCL %>% dplyr::filter(grepl('CL ', Symbol))
+rownames(subsetCL) <- subsetCL$Symbol
+
+dendcol_lipid_CL <- t(subsetCL[c(1:24)]) %>% dist(method = "euclidean") %>% hclust(method = "ward.D2") %>% as.dendrogram %>% color_branches( k = 2)
+
+#pdf("HM_ratlipidsp_CL.pdf", height = 20, width = 20) 
+Heatmap(as.matrix(subsetCL[c(1:24)]), bottom_annotation = colAnn_SHG, cluster_columns = dendcol_lipid_CL)
+#dev.off()
+```
+
+
+***
+~~METABOLOMICS~~
+***
+
+```{r}
+pacman::p_load(dplyr,tidyr,ggplot2,stringr,limma,ComplexHeatmap,circlize,dendextend)
+```
+
+```{r}
+#meta_check <- read.csv("data/amend_metodata.csv", check.names = FALSE)
+metabolites <- read.csv("data/datamatrix_repicked_rmsugar.csv")
+newlist <- read.csv("data/metabolomicslist4.csv")[,2]
+newlist <- as.data.frame(newlist)
+#remove 0s
+metabolites_rmNA <- na.omit(metabolites)
+
+#remove anything with 'labelled' in name
+metabolites_rmlabels <- metabolites_rmNA[!grepl("Labelled", metabolites_rmNA$Compound.name_HMDB.id),]
+metabolites_rmlabels <- metabolites_rmlabels[!grepl("13C", metabolites_rmlabels$Compound.name_HMDB.id),]
+metabolites_rmlabels <- metabolites_rmlabels[!grepl("13C", metabolites_rmlabels$Name),]
+
+```
+
+The rerun samples were removed, they had to be rerun because the syringe got damaged but there had been too much of a change to save these samples. QC samples were also removed. Hexanoylglycine was removed also due to negative numbers.
+```{r}
+#remove QC samples and rerun samples
+metabolites_cleaned <- metabolites_rmlabels[-c(26,29,31:42)]
+metabolites_cleaned <- metabolites_cleaned[!grepl("Hexanoylglycine_HMDB0000701", metabolites_cleaned$Compound.name_HMDB.id),]
+metabolites_cleaned <- metabolites_cleaned[!grepl("ITSD", metabolites_cleaned$Compound.name_HMDB.id),]
+metabolites_cleaned <- metabolites_cleaned[!grepl("13C5,15N1-Valine", metabolites_cleaned$Compound.name_HMDB.id),]
+```
+
+```{r}
+metabolites_cleaned <- merge(metabolites_cleaned, newlist, by.x = "Name", by.y = "newlist")
+metabolites_cleaned <- separate(data = metabolites_cleaned, col = Compound.name_HMDB.id, into = c("compoundname","HMDB"), sep = "_")
+rownames(metabolites_cleaned) <- metabolites_cleaned$compoundname
+```
+
+Fixed up the column labels to have just the names.
+```{r}
+#fix column names
+metabolites_long <- metabolites_cleaned %>% gather("sample","intensity",-Target,-Name, -compoundname, -HMDB)
+metabolites_long$sample <- str_match(metabolites_long$sample,"([A-Z]+_[A-Z]*[0-9]*)")[,1]
+metabolites_long$sample <- str_replace(metabolites_long$sample, "CG_", "")
+```
+
+Data logged first
+```{r}
+metabolites_wide <- metabolites_long %>% spread(sample,intensity)
+rownames(metabolites_wide) <- metabolites_wide$compoundname
+metabolite_matrix <- metabolites_wide[c(5:36)]
+metabolite_log <- log(metabolite_matrix,2)
+```
+
+pareto scaling applied
+```{r}
+#pareto scaling - 
+paretoscale <- function(z) {
+  rowmean <- apply(z,1,mean) #row means
+  rowsd <- apply(z,1,sd) #row standard deviation
+  rowsqrtsd <- sqrt(rowsd) #sqrt of sd
+  rv <- sweep(z,1,rowmean,"-") #mean center
+  rv <- sweep(rv,1,rowsqrtsd, "/") #divide by sqrtsd
+  return(rv)
+}
+
+pareto.logdata <- paretoscale(metabolite_log)
+```
+
+Data visualisation
+```{r}
+samplegroups <- read.csv("data/samplegroups.csv")
+
+#pca
+pca <- prcomp(t(as.matrix(pareto.logdata)), center = F, scale = F)
+pcaresults <- summary(pca)
+score.data <- as.data.frame(pcaresults$x)
+
+pcadata <- score.data[,c(1:3)]
+pcadata$sample <- rownames(pcadata)
+
+pcadata2 <- merge(pcadata, samplegroups, by= "sample")
+pcaplot <- ggplot(pcadata2, aes(PC1, PC2)) +
+  geom_point(aes( colour = group), size = 7) + geom_text(aes(label=sample),hjust=-0.1, vjust=0.1) + stat_ellipse(aes(colour=group))
+#pdf("PCA_kidneyrat_metabolites.pdf", height = 7, width = 9)
+pcaplot
+#dev.off()
+```
+
+```{r}
+#full dataframe annotated
+metabolites_info <- metabolites_wide[c(1:3)]
+normed_metabolites <- cbind(metabolites_info, pareto.logdata)
+```
+
+```{r}
+#statistical tests - 
+design <- model.matrix(~0 + group, samplegroups)
+colnames(design) <- gsub("group","", colnames(design))
+rownames(design) <- samplegroups$sample
+
+contr.matrix_kidney <- makeContrasts(
+    SHGvsControl = SHG-CTRL,
+    MHGvsControl = MHG-CTRL,
+    SHGvsMHG = SHG-MHG,
+    levels = design
+  )
+
+rownames(contr.matrix_kidney) <- gsub("Intercept","(Intercept)", rownames(contr.matrix_kidney))
+
+fit <- lmFit(pareto.logdata, design)
+cfit <- contrasts.fit(fit, contrasts = contr.matrix_kidney)
+efit<-eBayes(cfit)
+
+comparison <- topTable(efit, n=Inf, coef=1, adjust.method = "BH")
+comparison2 <- subset(comparison, comparison$adj.P.Val<0.05)
+#Heatmap
+dendrow <- comparison2[c(1:3)] %>% dist(method = "euclidean") %>% hclust(method = "average") %>% as.dendrogram %>% color_branches(k = 6)
+
+col = colorRamp2(c(-2, 0, 2), c("lightseagreen", "white", "mediumvioletred"))
+col = colorRamp2(c(-2, 0, 2),c("#3e5d89ff","white","#e9b919ff"))
+```
+
+#metabolites DE lists
+#write out each set of data
+```{r}
+allmetab_threewaycomp <- topTable(efit, n=Inf, adjust.method = "BH")
+threeway_DE <- subset(allmetab_threewaycomp, allmetab_threewaycomp$adj.P.Val<0.05)
+#write.xlsx(allmetab_threewaycomp, "allmetab_threewaycomp_2021-08.xlsx", rowNames = TRUE)
+
+allmetab_SHGvsNG <- topTable(efit, n=Inf, coef=1, adjust.method = "BH")
+SHGvsNG_DE <- subset(allmetab_SHGvsNG, allmetab_SHGvsNG$adj.P.Val<0.05)
+#write.xlsx(allmetab_SHGvsNG, "allmetab_SHGvsNG_2021-08.xlsx", rowNames = TRUE)
+
+allmetab_MHGvsNG <- topTable(efit, n=Inf, coef=2, adjust.method = "BH")
+MHGvsNG_DE <- subset(allmetab_MHGvsNG, allmetab_MHGvsNG$adj.P.Val<0.05)
+#write.xlsx(allmetab_MHGvsNG, "allmetab_MHGvsNG_2021-08.xlsx", rowNames = TRUE)
+
+allmetab_SHGvsMHG <- topTable(efit, n=Inf, coef=3, adjust.method = "BH")
+SHGvsMHG_DE <- subset(allmetab_SHGvsMHG, allmetab_SHGvsMHG$adj.P.Val<0.05)
+#write.xlsx(allmetab_SHGvsMHG, "allmetab_SHGvsMHG_2021-08.xlsx", rowNames = TRUE)
+```
+
+
+This heatmap is showing the proteins which are up/down regulated in the SHG compared with the control [I know you cant see it clearly, this will be outputted as a pdf]
+```{r}
+#pdf("HM_DEmeta_rat.pdf", height = 18, width = 5.5)
+Heatmap(as.matrix(comparison2[c(1)]), cluster_rows = dendrow, row_dend_width = unit(2, "cm"), row_names_gp = gpar(fontsize = 10), col = col, cluster_columns = FALSE)
+#dev.off()
+```
+
+```{r}
+#all expr data for SHG vs CTRL metabolites
+subsetmetabo <- rownames(comparison2)
+subsetmetabo <- as.data.frame(subsetmetabo)
+# re-sort the table by diabetes group, removing the samples that didnt work
+datacolnamesmetabo <- datacolnames
+datacolnamesmetabo <- datacolnamesmetabo[-c(36,24,11,12)]
+pareto.metabo <- pareto.logdata 
+pareto.metabo <- pareto.metabo[datacolnamesmetabo]
+
+
+#remove MHG so just SHG comparsion
+pareto.metabo <- pareto.metabo[c(1:10,22:32)]
+pareto.metabo$Metabolites <- rownames(pareto.metabo)
+subsetmetabo2 <- pareto.metabo %>% filter(Metabolites %in% subsetmetabo$subsetmetabo) 
+
+#HM annotations and dendogram
+dendcol_metabo <- t(subsetmetabo2[c(1:21)]) %>% dist(method = "euclidean") %>% hclust(method = "ward.D2") %>% as.dendrogram %>% color_branches(k = 2)
+dendrow_metabo <- (subsetmetabo2[c(1:21)]) %>% dist(method = "euclidean") %>% hclust(method = "complete") %>% as.dendrogram %>% color_branches(k = 4)
+rownames(subsetmetabo2) <- subsetmetabo2$Metabolites
+diabetestype_SHGmetabo <- diabetestype_SHG[-c(11,12,24)]
+
+colAnn_SHGmetabo <- HeatmapAnnotation(Diabetes=diabetestype_SHGmetabo, which="col", annotation_width=unit(c(1, 4), "cm"), gap=unit(1, "mm"),col = list(Diabetes = c("CTRL" = "darkgreen", "SHG" = "aquamarine")))
+
+col = colorRamp2(c(-2, 0, 2), c("#0A3C72", "white", "#7B0722"))
+
+#pdf("HMDESHG_metabolites_202102.pdf", height = 20, width = 10)
+Heatmap(as.matrix(subsetmetabo2[c(1:21)]), bottom_annotation = colAnn_SHGmetabo, cluster_rows = dendrow_metabo, cluster_columns = dendcol_metabo, col = col)
+#dev.off()
+```
+
+****
+~~~~CORRELATION ANALYSIS~~~~
+****
+
+PROTS VS LIPIDS
+
+```{r}
+#subset the data to include proteins which are upregulated for the DE and the FATTY ACIDS for the Lipids. 
+#needs to be the gene names or lipid names as colnames and sample names as rows
+
+
+correlationsamples <- sampledata
+correlationsamples <- correlationsamples[-c(13:24),]
+
+#all IM 
+kidneyprots1 <- subset2
+kidneyprots1 <- kidneyprots1[-c(1:5)]
+kidneyprots1 <- t(kidneyprots1)
+kidneyprots1 <- kidneyprots1[-c(13:24),]
+
+#lipid class
+kidneylipsclass <- T_norm[c(1:36)]
+kidneylipsclass <- t(kidneylipsclass)
+kidneylipsclass <- kidneylipsclass[-c(13:24),]
+
+P <- kidneyprots1
+dim(P)
+L <- kidneylipsclass
+dim(L)
+
+head(cbind(rownames(P), rownames(L)))
+
+#imgCor(P, L)
+
+kidneyrat.shrink <- rcc(P, L, ncomp = 3, method = 'shrinkage')
+plot(kidneyrat.shrink, scree.type = "barplot")
+
+#CV method - lambda parameters, then choose leave-one-out cross validation
+grid3 <- seq(0.05, 0.2, length = 5) 
+grid4 <- seq(0.0001, 0.2, length = 5)
+cv_kidney <- tune.rcc(P, L, grid1 = grid3, grid2 = grid4, validation = "loo")
+
+
+par(mfrow=c(1,1)) # to close the mfrow figure
+kidneyrat.rcc <- rcc(P,L, ncomp = 3,  lambda1 = cv_kidney$opt.lambda1, 
+              lambda2 = cv_kidney$opt.lambda2)
+plot(kidneyrat.rcc, scree.type = "barplot")
+
+#sample plots
+plotIndiv(kidneyrat.rcc, comp = 1:2, ind.names = correlationsamples$Sample, 
+          group = correlationsamples$Diabetes, rep.space = "XY-variate",
+          legend = TRUE, title = 'kidneyrat, rCCA XY-space')
+
+sampledata$Diabetes <- as.factor(correlationsamples$Diabetes)
+col.diabetes <- color.mixo(as.numeric(correlationsamples$Diabetes))
+plotArrow(kidneyrat.rcc, col  = col.diabetes, title = 'KidneyRat, arrow plot')
+
+
+#pdf("DEknown_protsvslipids_SHG.pdf", height = 15, width = 15)
+cim(kidneyrat.rcc, comp = 1:3, xlab = "Lipids", ylab = "Proteins", 
+    margins = c(10, 10), dist.method = c("euclidean", "euclidean"), clust.method = c("ward", "ward"), zoom = FALSE)
+#dev.off()
+
+#network(kidneyrat.rcc, comp = 1:3, interactive = FALSE, lwd.edge = 2)
+
+# Y = sampledata$Diabetes
+# data = list(protein = P, lipid = L)
+# design = matrix(c(0,1,1,1,0,1,1,1,0), ncol = 3, nrow = 3, byrow = TRUE)
+
+# kidneyrat.sgccda <- wrapper.sgccda(X=data,
+# Y = Y,
+# design = design,
+# keepX = list(protein=c(25,25), lipid=c(20,20)),
+# ncomp = 2,
+# scheme = "horst")
+
+#pdf("ratliver_circos_PvsL.pdf", height = 20, width = 25)
+#circosPlot(kidneyrat.sgccda, cutoff = 0.6, ncol.legend = 1, size.legend = 1, size.variables = 1.5, color.blocks = c("skyblue","greenyellow"), color.cor = c("orange", "purple"), showIntraLinks = FALSE, line = TRUE)
+#dev.off()
+```
+
+
+***
+~~Correlation of DE Prots with metabolites ~~
+***
+
+```{r}
+#can use the prots from earlier
+#kidneyprots1
+
+#all metabolites after cleaning - samples as rownames, metabolites as columns
+
+metabo_all <- t(pareto.logdata)
+metasamples <- samplegroups[c(1:2)]
+target <- c("CTRL", "MHG", "SHG")
+metasamples <- left_join(data.frame(group=target),samplegroups,by="group")
+#rearrange list to correspond to sample type
+target <- metasamples$sample
+metabo_all <- metabo_all[match(target, rownames(metabo_all)),]
+
+#just DE metabos
+demetabo <-rownames(comparison2)
+metabos <- metabo_all[,demetabo, drop = FALSE]
+metabos <- metabos[-c(11:21),]
+
+kidneyprots_DE <- kidneyprots1
+#have to remove the samples which correlate with the reruns in the metabolomics
+kidneyprots_DE <- kidneyprots_DE[-c(11,12,24,36),]
+
+M <- metabos
+dim(M)
+P2 <- kidneyprots_DE
+dim(P2)
+
+head(cbind(rownames(M), rownames(P2)))
+
+#imgCor(M, P2)
+```
+
+```{r}
+protsmetacorr.shrink <- rcc(M, P2, ncomp = 3, method = 'shrinkage')
+plot(protsmetacorr.shrink, scree.type = "barplot")
+
+#CV method - lambda parameters, then choose leave-one-out cross validation
+grid4 <- seq(0.05, 0.2, length = 5) 
+grid5 <- seq(0.0001, 0.2, length = 5)
+cv_kidneyprotsmeta <- tune.rcc(M, P2, grid1 = grid4, grid2 = grid5, validation = "loo")
+
+par(mfrow=c(1,1)) # to close the mfrow figure
+protsmetacorr.rcc <- rcc(P2,M, ncomp = 3,  lambda1 = cv_kidneyprotsmeta$opt.lambda1, 
+              lambda2 = cv_kidneyprotsmeta$opt.lambda2)
+plot(protsmetacorr.rcc, scree.type = "barplot")
+```
+
+```{r}
+plotIndiv(protsmetacorr.rcc, comp = 1:2, ind.names = metasamples$sample,
+          group = metasamples$group, rep.space = "XY-variate",
+          legend = TRUE, title = 'kidneyrat, rCCA XY-space')
+
+metasamples$group <- as.factor(metasamples$group)
+col.group <- color.mixo(as.numeric(metasamples$group))
+plotArrow(protsmetacorr.rcc, col  = col.group, title = 'KidneyRat, arrow plot')
+
+
+#pdf("DEprots_metabo_SHGonly_2021-07-16.pdf", height = 15, width = 15)
+cim(protsmetacorr.rcc, comp = 1:3, xlab = "Metabolites", ylab = "Proteins", 
+    margins = c(10, 10), dist.method = c("euclidean", "euclidean"), clust.method = c("ward", "ward"), zoom = FALSE)
+#dev.off()
+
+```
+
+
+***
+~~LIPIDOMICS CLASSES WHOLE CELL~~
+
+***
+
+Import and clean
+```{r}
+LK_WCgroups <- read_tsv("data/WC_groups.txt", na = "0", guess_max = 100000)
+LK_WCgroups <- as.data.frame(LK_WCgroups)
+rownames(LK_WCgroups) <- LK_WCgroups$`sample type`
+kidneySD_WC <- LK_WCgroups[c(1:2)]
+LK_WCgroups <- LK_WCgroups[-c(1:2)]
+#lipidkidney <- log2(lipidkidney)
+LK_WCgroups <-LK_WCgroups[sapply(LK_WCgroups, function(LK_WCgroups) !any(is.na(LK_WCgroups)))]
+
+```
+
+Normalisation
+```{r}
+#ttests
+#sampledata lipids
+K_SD_WC <- kidneySD_WC
+colnames(K_SD_WC) <- c("sample","diabetes")
+K_SD_WC <- K_SD_WC %>% 
+  mutate(diabetes = str_replace(diabetes, "black", "CTRL")) %>% 
+  mutate(diabetes = str_replace(diabetes, "blue", "MHG")) %>% 
+  mutate(diabetes = str_replace(diabetes, "red", "SHG"))
+
+#normalise the data - take the mean of the log 
+lipidkidney_log_WC <- log2(LK_WCgroups)
+lipidkidney_norm_WC <- normalizeQuantiles(lipidkidney_log_WC)
+#lipidkidney_norm <- lipidkidney_log
+```
+
+MDS plot
+```{r}
+#check mds
+T_norm_WC <- t(lipidkidney_norm_WC)
+mds_data_kid_WC <- plotMDS(T_norm_WC, plot = TRUE)
+mds_data_kid_WC <- data.frame(x=mds_data_kid_WC$x,y=mds_data_kid_WC$y,K_SD_WC[names(mds_data_kid_WC$x),])
+
+ggplot(mds_data_kid_WC,aes(x=x,y=y)) + geom_point(aes(color = diabetes), size=3)
+```
+
+Differential Expression analysis 
+```{r}
+#DE
+design_all <- model.matrix(~0 + diabetes, K_SD_WC)
+colnames(design_all) <- gsub("diabetes","", colnames(design_all))
+rownames(design_all) <- K_SD_WC$sample
+
+contr.matrix_kidneylipid <- makeContrasts(
+    CTRLvsMHG = MHG-CTRL,
+    CTRLvsSHG = SHG-CTRL,
+    MHGvsSHG = SHG-MHG,
+    levels = design_all
+  )
+
+all_fit <- lmFit(T_norm_WC, design_all)
+cfit_all <- contrasts.fit(all_fit, contrasts = contr.matrix_kidneylipid)
+all_efit<-eBayes(cfit_all)
+
+all_comp_lips_WC <- topTable(all_efit, coef=2, n=Inf, adjust.method = "BH")
+all_comp_lips_WC2 <- subset(all_comp_lips_WC, all_comp_lips_WC$adj.P.Val<0.05)
+
+#expression for HM overall
+subset_lipids_WC <- rownames(all_comp_lips_WC)
+subset_lipids_WC <- as.data.frame(subset_lipids_WC)
+T_norm_WC <- as.data.frame(T_norm_WC)
+T_norm_WC$Symbol <- rownames(T_norm_WC)
+subset_lipids_WC <- T_norm_WC %>% filter(Symbol %in% subset_lipids_WC$subset_lipids_WC) 
+rownames(subset_lipids_WC) <- subset_lipids_WC$Symbol
+diabetestype <- K_SD_WC$diabetes
+
+#shgonly
+diabetestype <- diabetestype[-c(13:24)]
+
+colAnn_lip <- HeatmapAnnotation(diabetestype=diabetestype, which="col", annotation_width=unit(c(1, 4), "cm"), gap=unit(1, "mm"))
+
+dendcol_lipid <- t(subsetlipids_wc) %>% dist(method = "euclidean") %>% hclust(method = "ward.D2") %>% as.dendrogram %>% color_branches( k = 2)
+
+#dendrow_lipid <- subset_lipids2[c(1:12,25:36)] %>% dist(method = "euclidean") %>% hclust(method = "ward.D2") %>% as.dendrogram %>% color_branches( k = 3)
+col = colorRamp2(c(11, 12, 13), c("#0A3C72", "white", "#7B0722"))
+
+subsetlipids_wc <- subset_lipids_WC[c(1:12,25:35)]
+subsetlipids_wc <- subsetlipids_wc[c(1,6,9,10,14,17,19:21,23,25,27,29:36),]
+
+#pdf("HM_WC_lipidsclass_SHG.pdf", height = 15, width = 17)
+Heatmap(as.matrix(subsetlipids_wc), bottom_annotation = colAnn_lip, cluster_columns = dendcol_lipid, col = col)
+#dev.off()
+```
+
+*** Correlation of DE Proteomics with Markers for DKD [HbA1c, Cystatin C, Albumin]
+
+## Protein ##
+```{r}
+library(openxlsx)
+library(ggpubr)
+biomarker_prots <- as.data.frame(P)
+biomarker_prots$samples <- rownames(biomarker_prots)
+prots_biomarker <- merge(biomarker_prots,sampledata, by.x = "samples", by.y = "Sample")
+
+#biomarker data
+biomarkers <- read.xlsx("data/DKD-markers.xlsx")
+rownames(biomarkers) <- biomarkers$X1
+biomarkers <- biomarkers[-c(1)]
+
+
+##Cystatin##
+cystatin <- biomarkers[c(3)]
+cystatin <- log2(cystatin)
+cystatin <- scale(cystatin)
+cystatin <- as.data.frame(cystatin)
+cystatin$sample <- rownames(cystatin)
+cystatin <- merge(cystatin,sampledata, by.x = "sample", by.y="Sample")
+cystatin <- cystatin[-c(4)]
+cystatin <- cystatin %>% gather("cystatin.c", "conc", -Diabetes, -sample)
+
+cystatinmerge_p <- merge(prots_biomarker,cystatin, by.x = "samples", by.y = "sample")
+cystatinmerge_p <- cystatinmerge_p[-c(93,94)]
+cystatinmerge_p <- cystatinmerge_p %>% gather(protein, protconc, -"cystatin.c", -"Diabetes.x", -"samples", -"conc")
+
+pdf("Figure_2022_08/Corrtest_cystatinprots_202208.pdf", height = 40, width = 35)
+ggplot(cystatinmerge_p, aes(x = conc, y = protconc)) + 
+  geom_point(aes(color = Diabetes.x),  size = 3) + 
+  stat_smooth(method = "lm",
+              color = "black") + facet_wrap(~protein, scales = "free") + stat_cor(aes(label = paste0(..r.label.., "~`,`~`p=`~", p.adjust(readr::parse_number(..p.label..), n = 90))),
+               method = "spearman") 
+dev.off()
+
+##Albumin##
+albumin <- biomarkers[c(4)]
+albumin <- log2(albumin)
+albumin <- scale(albumin)
+albumin <- as.data.frame(albumin)
+albumin$sample <- rownames(albumin)
+albumin <- merge(albumin,sampledata, by.x = "sample", by.y="Sample")
+albumin <- albumin[-c(4)]
+albumin <- albumin %>% gather("albumin", "conc", -Diabetes, -sample)
+
+albuminmerge_p <- merge(prots_biomarker,albumin, by.x = "samples", by.y = "sample")
+albuminmerge_p <- albuminmerge_p[-c(93,94)]
+albuminmerge_p <- albuminmerge_p %>% gather(protein, protconc, -"albumin", -"Diabetes.x", -"samples", -"conc")
+
+pdf("Figure_2022_08/Corrtest_albuminprots_2022.pdf", height = 40, width = 35)
+ggplot(albuminmerge_p, aes(x = conc, y = protconc)) + 
+  geom_point(aes(color = Diabetes.x),  size = 3) + 
+  stat_smooth(method = "lm",
+              color = "black") + facet_wrap(~protein, scales = "free") + stat_cor(aes(label = paste0(..r.label.., "~`,`~`p=`~", p.adjust(readr::parse_number(..p.label..), n = 90))),
+               method = "spearman") 
+dev.off()
+
+###HbA1C###
+hba1c <- biomarkers[c(2)]
+hba1c <- log2(hba1c)
+hba1c <- scale(hba1c)
+hba1c <- as.data.frame(hba1c)
+hba1c$sample <- rownames(hba1c)
+hba1c <- merge(hba1c,sampledata, by.x = "sample", by.y="Sample")
+hba1c <- hba1c[-c(4)]
+hba1c <- hba1c %>% gather("HbA1c", "conc", -Diabetes, -sample)
+
+hba1cmerge_p <- merge(prots_biomarker,hba1c, by.x = "samples", by.y = "sample")
+hba1cmerge_p <- hba1cmerge_p[-c(93,94)]
+hba1cmerge_p <- hba1cmerge_p %>% gather(protein, protconc, -"HbA1c", -"Diabetes.x", -"samples", -"conc")
+
+pdf("Figure_2022_08/Corrtest_HBA1Cprots_202208.pdf", height = 38, width = 35)
+ggplot(hba1cmerge_p, aes(x = conc, y = protconc)) + 
+  geom_point(aes(color = Diabetes.x),  size = 3) + 
+  stat_smooth(method = "lm",
+              color = "black") + facet_wrap(~protein, scales = "free") + stat_cor(aes(label = paste0(..r.label.., "~`,`~`p=`~", p.adjust(readr::parse_number(..p.label..), n = 90))),
+               method = "spearman") 
+dev.off()
+```
+
+##Metabolites ##
+```{r}
+biomarker_metabo <- as.data.frame(M)
+biomarker_metabo$samples <- rownames(biomarker_metabo)
+metabo_biomarker <- merge(biomarker_metabo,samplegroups, by.x = "samples", by.y = "sample")
+
+
+##Cystatin##
+cystatinmerge_m <- merge(metabo_biomarker,cystatin, by.x = "samples", by.y = "sample")
+cystatinmerge_m <- cystatinmerge_m[-c(72)]
+cystatinmerge_m <- cystatinmerge_m %>% gather(metabolite, metaboconc, -"cystatin.c", -"Diabetes", -"samples", -"conc")
+
+pdf("Figure_2022_08/Corrtest_cystatinmetabo_202208.pdf", height = 40, width = 35)
+ggplot(cystatinmerge_m, aes(x = conc, y = metaboconc)) + 
+  geom_point(aes(color = Diabetes),  size = 3) + 
+  stat_smooth(method = "lm",
+              color = "black") + facet_wrap(~metabolite, scales = "free") + stat_cor(aes(label = paste0(..r.label.., "~`,`~`p=`~", p.adjust(readr::parse_number(..p.label..), n = 70))),
+               method = "spearman")
+dev.off()
+
+##Albumin##
+albuminmerge_m <- merge(metabo_biomarker,albumin, by.x = "samples", by.y = "sample")
+albuminmerge_m <- albuminmerge_m[-c(72)]
+albuminmerge_m <- albuminmerge_m %>% gather(metabolite, metaboconc, -"albumin", -"Diabetes", -"samples", -"conc")
+
+pdf("Figure_2022_08/Corrtest_albuminmetabo_2022.pdf", height = 40, width = 35)
+ggplot(albuminmerge_m, aes(x = conc, y = metaboconc)) + 
+  geom_point(aes(color = Diabetes),  size = 3) + 
+  stat_smooth(method = "lm",
+              color = "black") + facet_wrap(~metabolite, scales = "free") + stat_cor(aes(label = paste0(..r.label.., "~`,`~`p=`~", p.adjust(readr::parse_number(..p.label..), n = 70))),
+               method = "spearman")
+dev.off()
+
+##HbA1c##
+hba1cmerge_m <- merge(metabo_biomarker,hba1c, by.x = "samples", by.y = "sample")
+hba1cmerge_m <- hba1cmerge_m[-c(72)]
+hba1cmerge_m <- hba1cmerge_m %>% gather(metabolite, metaboconc, -"HbA1c", -"Diabetes", -"samples", -"conc")
+
+pdf("Figure_2022_08/Corrtest_HBA1Cmetabo_202208.pdf", height = 38, width = 35)
+ggplot(hba1cmerge_m, aes(x = conc, y = metaboconc)) + 
+  geom_point(aes(color = Diabetes),  size = 3) + 
+  stat_smooth(method = "lm",
+              color = "black") + facet_wrap(~metabolite, scales = "free") + stat_cor(aes(label = paste0(..r.label.., "~`,`~`p=`~", p.adjust(readr::parse_number(..p.label..), n = 70))),
+               method = "spearman")
+dev.off()
+```
+
